@@ -1,4 +1,4 @@
-
+# database.py
 import sqlite3
 import hashlib
 import secrets
@@ -32,15 +32,12 @@ def hash_password(password, salt=None):
 
 def verify_password(password, salt_hex, stored_hash):
     salt = bytes.fromhex(salt_hex)
-
     _, password_hash = hash_password(password, salt)
-
     return secrets.compare_digest(password_hash, stored_hash)
 
 
 def init_db():
     with get_connection() as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS patients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +79,17 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (patient_id) 
+                    REFERENCES patients(patient_id)
+            )
+        """)
         conn.commit()
 
 
@@ -99,9 +107,7 @@ def register_patient(full_name, email, age, gender, password):
         return False, "Password must contain at least 8 characters."
 
     salt, password_hash = hash_password(password)
-
     patient_id = "PAT-" + secrets.token_hex(4).upper()
-
     created_at = datetime.now(timezone.utc).isoformat()
 
     try:
@@ -113,39 +119,25 @@ def register_patient(full_name, email, age, gender, password):
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                patient_id,
-                full_name,
-                email,
-                age,
-                gender,
-                salt,
-                password_hash,
-                created_at
+                patient_id, full_name, email, age,
+                gender, salt, password_hash, created_at
             ))
-
         return True, patient_id
-
     except sqlite3.IntegrityError:
         return False, "An account with this email already exists."
 
 
 def authenticate_patient(email, password):
     email = email.strip().lower()
-
     with get_connection() as conn:
         patient = conn.execute("""
-            SELECT * FROM patients
-            WHERE email = ?
+            SELECT * FROM patients WHERE email = ?
         """, (email,)).fetchone()
 
     if patient is None:
         return None
 
-    if not verify_password(
-        password,
-        patient["salt"],
-        patient["password_hash"]
-    ):
+    if not verify_password(password, patient["salt"], patient["password_hash"]):
         return None
 
     return dict(patient)
@@ -154,25 +146,14 @@ def authenticate_patient(email, password):
 def get_patient(patient_id):
     with get_connection() as conn:
         patient = conn.execute("""
-            SELECT patient_id, full_name, email, age,
-                   gender, created_at
-            FROM patients
-            WHERE patient_id = ?
+            SELECT patient_id, full_name, email, age, gender, created_at
+            FROM patients WHERE patient_id = ?
         """, (patient_id,)).fetchone()
-
     return dict(patient) if patient else None
 
 
-def save_health_reading(
-    patient_id,
-    heart_rate=None,
-    systolic_bp=None,
-    diastolic_bp=None,
-    spo2=None,
-    temperature=None
-):
+def save_health_reading(patient_id, heart_rate=None, systolic_bp=None, diastolic_bp=None, spo2=None, temperature=None):
     recorded_at = datetime.now(timezone.utc).isoformat()
-
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO health_readings (
@@ -180,15 +161,7 @@ def save_health_reading(
                 diastolic_bp, spo2, temperature, recorded_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patient_id,
-            heart_rate,
-            systolic_bp,
-            diastolic_bp,
-            spo2,
-            temperature,
-            recorded_at
-        ))
+        """, (patient_id, heart_rate, systolic_bp, diastolic_bp, spo2, temperature, recorded_at))
 
 
 def get_health_history(patient_id):
@@ -198,25 +171,18 @@ def get_health_history(patient_id):
             WHERE patient_id = ?
             ORDER BY recorded_at DESC
         """, (patient_id,)).fetchall()
-
     return [dict(row) for row in rows]
 
 
 def save_prediction(patient_id, symptoms, predicted_class):
     recorded_at = datetime.now(timezone.utc).isoformat()
-
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO predictions (
                 patient_id, symptoms, predicted_class, recorded_at
             )
             VALUES (?, ?, ?, ?)
-        """, (
-            patient_id,
-            symptoms,
-            predicted_class,
-            recorded_at
-        ))
+        """, (patient_id, symptoms, predicted_class, recorded_at))
 
 
 def get_prediction_history(patient_id):
@@ -226,5 +192,30 @@ def get_prediction_history(patient_id):
             WHERE patient_id = ?
             ORDER BY recorded_at DESC
         """, (patient_id,)).fetchall()
-
     return [dict(row) for row in rows]
+
+
+def save_chat_message(patient_id, role, content):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO chat_messages (patient_id, role, content, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (patient_id, role, content, timestamp))
+
+
+def get_chat_history(patient_id):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT role, content FROM chat_messages
+            WHERE patient_id = ?
+            ORDER BY timestamp ASC
+        """, (patient_id,)).fetchall()
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
+
+
+def clear_chat_history(patient_id):
+    with get_connection() as conn:
+        conn.execute("""
+            DELETE FROM chat_messages WHERE patient_id = ?
+        """, (patient_id,))

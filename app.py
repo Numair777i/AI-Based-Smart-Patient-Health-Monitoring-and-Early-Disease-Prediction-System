@@ -1,8 +1,9 @@
-
+# app.py
 import json
 import os
 import re
 import html
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from datetime import datetime, timezone
 from io import BytesIO
@@ -11,14 +12,13 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 import joblib
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
-from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.naive_bayes import GaussianNB
@@ -36,11 +36,29 @@ import database
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "disease_model_augmented.joblib"
 
+env_path = BASE_DIR / ".env"
+if env_path.exists() and not os.getenv("OPENROUTER_API_KEY"):
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ[k.strip()] = v.strip().strip('"').strip("'")
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+AI_MODELS = [
+    "openrouter/free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+]
+if os.getenv("OPENROUTER_MODEL"):
+    AI_MODELS.insert(0, os.environ["OPENROUTER_MODEL"].strip())
+
 st.set_page_config(
     page_title="AI Health Monitor",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 database.init_db()
@@ -51,7 +69,46 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 
-@st.cache_data(show_spinner=False)
+def ask_ai(messages, temperature=0.3):
+    client = OpenAI(
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        base_url=OPENROUTER_BASE_URL
+    )
+    errors = []
+    for model_id in AI_MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                temperature=temperature
+            )
+            content = response.choices[0].message.content
+            if content:
+                return content
+            errors.append(f"{model_id}: empty response")
+        except Exception as exc:
+            errors.append(f"{model_id}: {exc}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def ask_ai_with_live_status(messages, status_box, phrases, temperature=0.3, interval=2.5):
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(ask_ai, messages, temperature)
+        step = 0
+        while True:
+            phrase = phrases[min(step, len(phrases) - 1)]
+            status_box.markdown(
+                f'<div class="thinking-text">{html.escape(phrase)}</div>',
+                unsafe_allow_html=True
+            )
+            done, _ = wait([future], timeout=interval)
+            if done:
+                break
+            step += 1
+        status_box.empty()
+        return future.result()
+
+
 def run_model_benchmark():
     """Evaluate standard classifiers using stratified CV on Training.csv only."""
     training_path = BASE_DIR / "dataset" / "Training.csv"
@@ -83,8 +140,7 @@ def run_model_benchmark():
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
     models = {
         "Random Forest": RandomForestClassifier(
-            n_estimators=150, random_state=42, class_weight="balanced",
-            n_jobs=-1
+            n_estimators=150, random_state=42, class_weight="balanced", n_jobs=-1
         ),
         "Decision Tree": DecisionTreeClassifier(
             random_state=42, class_weight="balanced"
@@ -98,9 +154,7 @@ def run_model_benchmark():
         ),
         "Logistic Regression": make_pipeline(
             StandardScaler(),
-            LogisticRegression(
-                max_iter=2000, class_weight="balanced", random_state=42
-            )
+            LogisticRegression(max_iter=2000, class_weight="balanced", random_state=42)
         ),
     }
 
@@ -131,28 +185,98 @@ def run_model_benchmark():
     ).reset_index(drop=True), len(data), X.shape[1], y.nunique(), folds
 
 
+# ---------------- SESSION STATE ----------------
+
 if "patient" not in st.session_state:
     st.session_state.patient = None
+
+if "active_view" not in st.session_state:
+    st.session_state.active_view = "AI Health Assistant"
+
+if "health_assistant_messages" not in st.session_state:
+    st.session_state.health_assistant_messages = []
 
 
 # ---------------- STYLING ----------------
 
 st.markdown("""
 <style>
+.stAppDeployButton, [data-testid="stToolbarActions"], #MainMenu {
+    display: none !important;
+}
+header[data-testid="stHeader"] {
+    background: transparent !important;
+}
+button[data-testid="stExpandSidebarButton"],
+button[data-testid="collapsedControl"] {
+    background-color: rgba(139, 92, 246, 0.12) !important;
+    border: 1px solid rgba(139, 92, 246, 0.35) !important;
+    border-radius: 10px !important;
+    padding: 0.35rem !important;
+}
 .block-container {
-    max-width: 1150px;
-    padding-top: 2rem;
-    padding-bottom: 2rem;
+    max-width: 100% !important;
+    padding-left: 3.5rem !important;
+    padding-right: 2.5rem !important;
+    padding-top: 1rem !important;
+    padding-bottom: 3rem !important;
 }
-.hero {
-    padding: 1.5rem;
-    border-radius: 18px;
-    background: linear-gradient(120deg, #102b46, #176b70);
-    color: white;
-    margin-bottom: 1.2rem;
+[data-testid="stChatMessage"],
+[data-testid="stChatInput"] {
+    max-width: 840px;
+    margin-left: auto;
+    margin-right: auto;
 }
-.hero h1 { color: white; }
-.hero p { color: #e1f5f4; }
+[data-testid="stChatMessageAvatarUser"],
+[data-testid="stChatMessageAvatarAssistant"] {
+    display: none !important;
+}
+.brand-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.35rem;
+}
+.welcome-box {
+    text-align: center;
+    padding: 4rem 1rem 2rem 1rem;
+    max-width: 840px;
+    margin: 0 auto;
+}
+.welcome-box h1 {
+    background: linear-gradient(90deg, #8b5cf6, #a855f7, #d946ef);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-size: 2.75rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    line-height: 1.2;
+}
+.welcome-box p {
+    font-size: 1.05rem;
+    opacity: 0.78;
+    margin: 0;
+}
+div.stButton > button {
+    border-radius: 12px !important;
+    white-space: normal !important;
+    height: auto !important;
+    min-height: 2.75rem !important;
+    padding: 0.55rem 0.9rem !important;
+    line-height: 1.35 !important;
+}
+.thinking-text {
+    padding: 0.4rem 0;
+    font-size: 0.95rem;
+    opacity: 0.8;
+    animation: thinking-pulse 1.6s ease-in-out infinite;
+}
+@keyframes thinking-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 0.9; }
+}
 .patient-card {
     border: 1px solid rgba(128,128,128,0.35);
     border-radius: 14px;
@@ -163,161 +287,39 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ---------------- HEADER ----------------
+# ---------------- HELPER FUNCTIONS ----------------
 
-st.markdown("""
-<div class="hero">
-    <h1>🏥 AI Health Monitor</h1>
-    <p>Smart Patient Health Monitoring & Early Disease Prediction</p>
-</div>
-""", unsafe_allow_html=True)
+def get_dynamic_greeting(patient):
+    name = patient["full_name"].split()[0] if patient else "there"
+    greetings = [
+        f"Hello, {name}",
+        "Welcome! Everything fine?",
+        f"Good to see you, {name}",
+        "How are you feeling today?",
+        "Welcome back! How can I help?",
+        f"Hi {name}, what's on your mind?"
+    ]
+    if "greeting_index" not in st.session_state:
+        st.session_state.greeting_index = 0
+    greeting = greetings[st.session_state.greeting_index % len(greetings)]
+    st.session_state.greeting_index += 1
+    return greeting
 
-st.warning(
-    "Academic prototype only. This system is not a medical device "
-    "and must not be used to diagnose or treat diseases."
-)
-
-
-# ---------------- AUTHENTICATION ----------------
-
-def authentication_page():
-
-    st.title("Welcome to AI Health Monitor")
-    st.write("Register as a patient or log in to access your dashboard.")
-
-    login_tab, register_tab = st.tabs([
-        "Patient Login",
-        "New Patient Registration"
-    ])
-
-    with login_tab:
-
-        st.subheader("Patient Login")
-
-        with st.form("login_form"):
-
-            email = st.text_input("Email address")
-            password = st.text_input("Password", type="password")
-
-            login_button = st.form_submit_button(
-                "Login",
-                type="primary",
-                use_container_width=True
-            )
-
-        if login_button:
-
-            if not email.strip() or not password:
-                st.error("Please enter your email and password.")
-
-            else:
-                patient = database.authenticate_patient(email, password)
-
-                if patient:
-                    st.session_state.patient = database.get_patient(
-                        patient["patient_id"]
-                    )
-                    st.success("Login successful!")
-                    st.rerun()
-                else:
-                    st.error("Invalid email or password.")
-
-    with register_tab:
-
-        st.subheader("Create Patient Account")
-
-        with st.form("registration_form"):
-
-            full_name = st.text_input("Full Name")
-            email = st.text_input("Email Address")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                age = st.number_input(
-                    "Age", min_value=1, max_value=120, value=18
-                )
-
-            with col2:
-                gender = st.selectbox(
-                    "Gender",
-                    ["Male", "Female", "Other", "Prefer not to say"]
-                )
-
-            new_password = st.text_input(
-                "Create Password", type="password"
-            )
-
-            confirm_password = st.text_input(
-                "Confirm Password", type="password"
-            )
-
-            register_button = st.form_submit_button(
-                "Create Account",
-                type="primary",
-                use_container_width=True
-            )
-
-        if register_button:
-
-            if not full_name.strip() or not email.strip():
-                st.error("Please fill in your name and email.")
-
-            elif "@" not in email or "." not in email.split("@")[-1]:
-                st.error("Please enter a valid email address.")
-
-            elif new_password != confirm_password:
-                st.error("Passwords do not match.")
-
-            elif len(new_password) < 8:
-                st.error("Password must contain at least 8 characters.")
-
-            else:
-
-                success, result = database.register_patient(
-                    full_name=full_name,
-                    email=email,
-                    age=int(age),
-                    gender=gender,
-                    password=new_password
-                )
-
-                if success:
-                    st.success("Registration successful!")
-                    st.info(f"Your Patient ID is: {result}")
-                    st.write("Please log in to access your account.")
-                else:
-                    st.error(result)
-
-
-# ---------------- HEALTH READING WARNINGS ----------------
 
 def get_health_warnings(heart_rate, systolic, diastolic, spo2, temperature):
-
     warnings = []
     notes = []
 
-    # General adult resting reference ranges.
-    # These are not personalized medical limits.
-
     if heart_rate < 60 or heart_rate > 100:
-        warnings.append(
-            "Heart rate is outside the typical adult resting range "
-            "of 60–100 BPM."
-        )
+        warnings.append("Heart rate is outside the typical adult resting range of 60–100 BPM.")
 
     if systolic >= 130 or diastolic >= 80:
         warnings.append(
-            "Blood pressure is above the general reference threshold "
-            "of 130/80 mmHg. Repeated measurements and clinical "
-            "assessment are needed."
+            "Blood pressure is above the general reference threshold of 130/80 mmHg. "
+            "Repeated measurements and clinical assessment are needed."
         )
-
     elif systolic < 90 or diastolic < 60:
-        warnings.append(
-            "Blood pressure is below the general reference threshold "
-            "of 90/60 mmHg."
-        )
+        warnings.append("Blood pressure is below the general reference threshold of 90/60 mmHg.")
 
     if spo2 < 95:
         warnings.append(
@@ -333,48 +335,31 @@ def get_health_warnings(heart_rate, systolic, diastolic, spo2, temperature):
 
     if not warnings:
         notes.append(
-            "All entered values are within the selected general "
-            "reference ranges. This does not guarantee good health."
+            "All entered values are within the selected general reference ranges. "
+            "This does not guarantee good health."
         )
 
     return warnings, notes
 
 
-
 def build_patient_health_pdf(patient, health_history, prediction_history):
-    """Create a compact, readable educational health summary PDF in memory."""
     buffer = BytesIO()
     document = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=12 * mm,
-        leftMargin=12 * mm,
-        topMargin=10 * mm,
-        bottomMargin=12 * mm,
-        title="Patient Health Summary"
+        buffer, pagesize=A4, rightMargin=12*mm, leftMargin=12*mm,
+        topMargin=10*mm, bottomMargin=12*mm, title="Patient Health Summary"
     )
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
-        name="ReportSmall",
-        parent=styles["BodyText"],
-        fontSize=7,
-        leading=9,
-        textColor=colors.HexColor("#555555"),
-        spaceAfter=1
+        name="ReportSmall", parent=styles["BodyText"], fontSize=7,
+        leading=9, textColor=colors.HexColor("#555555"), spaceAfter=1
     ))
     styles.add(ParagraphStyle(
-        name="ReportCell",
-        parent=styles["BodyText"],
-        fontSize=6.5,
-        leading=8,
-        wordWrap="CJK"
+        name="ReportCell", parent=styles["BodyText"], fontSize=6.5,
+        leading=8, wordWrap="CJK"
     ))
     styles.add(ParagraphStyle(
-        name="ReportHeader",
-        parent=styles["BodyText"],
-        fontSize=6.5,
-        leading=8,
-        textColor=colors.white
+        name="ReportHeader", parent=styles["BodyText"], fontSize=6.5,
+        leading=8, textColor=colors.white
     ))
     story = []
 
@@ -384,6 +369,8 @@ def build_patient_health_pdf(patient, health_history, prediction_history):
         return html.escape(str(value))
 
     def short_datetime(value):
+        # Note: We use <br/> here because the returned string is passed directly into a
+        # ReportLab Paragraph, which parses basic HTML tags for styling and line breaks.
         if value is None or str(value).strip() == "":
             return "Not recorded"
         raw = str(value).strip()
@@ -418,11 +405,6 @@ def build_patient_health_pdf(patient, health_history, prediction_history):
 
     story.append(Paragraph("AI Health Monitor", styles["Title"]))
     story.append(Paragraph("Patient Health Summary Report", styles["Heading2"]))
-    story.append(Paragraph(
-        "Academic prototype only. This report is not a medical diagnosis, "
-        "medical device output, or treatment recommendation.",
-        styles["ReportSmall"]
-    ))
     story.append(Spacer(1, 4))
 
     story.append(Paragraph("Patient Profile", styles["Heading2"]))
@@ -462,8 +444,7 @@ def build_patient_health_pdf(patient, health_history, prediction_history):
                 cell(item.get("temperature"))
             ])
         health_table = Table(
-            health_rows,
-            repeatRows=1,
+            health_rows, repeatRows=1,
             colWidths=[43 * mm, 24 * mm, 24 * mm, 24 * mm, 22 * mm, 35 * mm]
         )
         style_table(health_table)
@@ -491,8 +472,7 @@ def build_patient_health_pdf(patient, health_history, prediction_history):
                 Paragraph(safe(item.get("predicted_class")), styles["ReportCell"])
             ])
         prediction_table = Table(
-            prediction_rows,
-            repeatRows=1,
+            prediction_rows, repeatRows=1,
             colWidths=[38 * mm, 78 * mm, 56 * mm]
         )
         style_table(prediction_table)
@@ -514,457 +494,299 @@ def build_patient_health_pdf(patient, health_history, prediction_history):
     return buffer.getvalue()
 
 
-# ---------------- PATIENT DASHBOARD ----------------
+# ---------------- TOP HEADER BAR (LEFT LOGO, RIGHT ACTIONS) ----------------
 
-def patient_dashboard():
-
+def render_top_navbar():
     patient = st.session_state.patient
+    nav_left, nav_spacer, nav_lang, nav_auth = st.columns([2.2, 4.2, 1.3, 1.1])
 
-    st.sidebar.title("Patient Dashboard")
-    st.sidebar.success("Logged in")
-    st.sidebar.write(f"**{patient['full_name']}**")
-    st.sidebar.caption(patient["patient_id"])
-
-    if st.sidebar.button("Logout", use_container_width=True):
-        st.session_state.patient = None
-        st.rerun()
-
-    st.title(f"Welcome, {patient['full_name']} 👋")
-
-    st.caption(
-        f"Patient ID: {patient['patient_id']} | "
-        f"Age: {patient['age']} | Gender: {patient['gender']}"
-    )
-
-    profile_tab, monitoring_tab, prediction_tab, history_tab, assistant_tab, benchmark_tab, report_tab = st.tabs([
-        "Patient Profile",
-        "Health Monitoring",
-        "Disease Prediction",
-        "Prediction History",
-        "AI Health Assistant",
-        "ML Benchmarking",
-        "PDF Health Report"
-    ])
-
-    # ---------------- PROFILE ----------------
-
-    with profile_tab:
-
-        st.subheader("Your Patient Profile")
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric("Patient ID", patient["patient_id"])
-        col2.metric("Age", patient["age"])
-        col3.metric("Gender", patient["gender"])
-
-        safe_name = html.escape(str(patient["full_name"]))
-        safe_email = html.escape(str(patient["email"]))
-        safe_id = html.escape(str(patient["patient_id"]))
-
+    with nav_left:
         st.markdown(
-            f"""
-            <div class="patient-card">
-                <h4>Personal Information</h4>
-                <p><b>Name:</b> {safe_name}</p>
-                <p><b>Email:</b> {safe_email}</p>
-                <p><b>Patient ID:</b> {safe_id}</p>
-            </div>
-            """,
+            '<div class="brand-title">🏥 AI Health Monitor</div>',
             unsafe_allow_html=True
         )
 
-        st.info("Your patient account is connected to the local database.")
-
-    # ---------------- HEALTH MONITORING ----------------
-
-    with monitoring_tab:
-
-        st.subheader("Smart Health Monitoring")
-
-        st.caption(
-            "Enter your health readings below. These are manually "
-            "entered measurements, not live sensor readings."
+    with nav_lang:
+        st.selectbox(
+            "Language",
+            ["Match my message", "English", "Hindi", "Hinglish"],
+            key="assistant_response_language",
+            label_visibility="collapsed"
         )
 
-        with st.form("health_reading_form"):
-
-            st.markdown("#### Heart Rate")
-
-            heart_rate = st.number_input(
-                "Heart Rate (BPM)",
-                min_value=40,
-                max_value=180,
-                value=75
-            )
-
-            st.markdown("#### Blood Pressure")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                systolic = st.number_input(
-                    "Systolic Pressure (mmHg)",
-                    min_value=60,
-                    max_value=250,
-                    value=120
-                )
-
-            with col2:
-                diastolic = st.number_input(
-                    "Diastolic Pressure (mmHg)",
-                    min_value=30,
-                    max_value=150,
-                    value=80
-                )
-
-            st.markdown("#### Oxygen Saturation")
-
-            spo2 = st.number_input(
-                "SpO2 (%)",
-                min_value=50,
-                max_value=100,
-                value=98
-            )
-
-            st.markdown("#### Body Temperature")
-
-            temperature = st.number_input(
-                "Temperature (°C)",
-                min_value=30.0,
-                max_value=45.0,
-                value=36.8,
-                step=0.1,
-                format="%.1f"
-            )
-
-            save_reading = st.form_submit_button(
-                "Save Health Reading",
-                type="primary",
-                use_container_width=True
-            )
-
-        if save_reading:
-
-            if systolic <= diastolic:
-                st.error(
-                    "Systolic pressure should be higher than "
-                    "diastolic pressure. Please verify your readings."
-                )
-
-            else:
-
-                database.save_health_reading(
-                    patient_id=patient["patient_id"],
-                    heart_rate=float(heart_rate),
-                    systolic_bp=float(systolic),
-                    diastolic_bp=float(diastolic),
-                    spo2=float(spo2),
-                    temperature=float(temperature)
-                )
-
-                st.session_state["health_reading_saved"] = True
+    with nav_auth:
+        if patient is None:
+            if st.button("Sign In", use_container_width=True, type="primary", key="top_signin_btn"):
+                st.session_state.active_view = "Login / Register"
+                st.rerun()
+        else:
+            if st.button(f"👤 {patient['full_name'].split()[0]}", use_container_width=True, key="top_profile_btn"):
+                st.session_state.active_view = "Records & PDF Report"
                 st.rerun()
 
-        if st.session_state.get("health_reading_saved", False):
 
-            st.success("Health reading saved successfully!")
-            st.session_state["health_reading_saved"] = False
+# ---------------- AUTHENTICATION VIEW ----------------
 
-        st.divider()
+def render_authentication_view(notice_message=None):
+    _, center_col, _ = st.columns([1, 2.2, 1])
+    with center_col:
+        if notice_message:
+            st.info(notice_message)
 
-        st.subheader("Latest Health Readings")
-
-        health_history = database.get_health_history(
-            patient["patient_id"]
+        st.subheader("Sign In or Create a Patient Account")
+        st.caption(
+            "Log in to save vitals, store symptom predictions, and export PDF health summaries."
         )
 
-        if health_history:
+        login_tab, register_tab = st.tabs([
+            "Patient Login",
+            "New Patient Registration"
+        ])
 
-            latest = health_history[0]
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Heart Rate",
-                f"{latest['heart_rate']:.0f} BPM"
-            )
-
-            col2.metric(
-                "Blood Pressure",
-                f"{latest['systolic_bp']:.0f}/"
-                f"{latest['diastolic_bp']:.0f} mmHg"
-            )
-
-            col3.metric(
-                "SpO2",
-                f"{latest['spo2']:.0f}%"
-            )
-
-            col4, col5 = st.columns(2)
-
-            col4.metric(
-                "Temperature",
-                f"{latest['temperature']:.1f} °C"
-            )
-
-            col5.metric(
-                "Recorded",
-                pd.to_datetime(
-                    latest["recorded_at"], utc=True
-                ).strftime("%d %b %Y, %I:%M %p UTC")
-            )
-
-            warnings, notes = get_health_warnings(
-                latest["heart_rate"],
-                latest["systolic_bp"],
-                latest["diastolic_bp"],
-                latest["spo2"],
-                latest["temperature"]
-            )
-
-            st.markdown("#### Health Reading Review")
-
-            if warnings:
-                for warning in warnings:
-                    st.warning(warning)
-            else:
-                for note in notes:
-                    st.success(note)
-
-            st.caption(
-                "Reference ranges are general adult screening references, "
-                "not personalized medical advice. A single reading cannot "
-                "establish a medical condition."
-            )
-
-            # ---------------- HEALTH CHARTS ----------------
-
-            st.divider()
-            st.subheader("Health Trends")
-
-            chart_df = pd.DataFrame(health_history)
-
-            chart_df["recorded_at"] = pd.to_datetime(
-                chart_df["recorded_at"], utc=True
-            )
-
-            chart_df = chart_df.sort_values("recorded_at")
-
-            chart_df = chart_df.set_index("recorded_at")
-
-            chart_tab1, chart_tab2, chart_tab3 = st.tabs([
-                "Heart Rate",
-                "Blood Pressure",
-                "SpO2 & Temperature"
-            ])
-
-            with chart_tab1:
-                st.line_chart(
-                    chart_df[["heart_rate"]],
-                    y_label="Beats per minute"
+        with login_tab:
+            with st.form("login_form"):
+                email = st.text_input("Email address")
+                password = st.text_input("Password", type="password")
+                login_button = st.form_submit_button(
+                    "Login", type="primary", use_container_width=True
                 )
 
-            with chart_tab2:
-                st.line_chart(
-                    chart_df[["systolic_bp", "diastolic_bp"]],
-                    y_label="mmHg"
-                )
+            if login_button:
+                if not email.strip() or not password:
+                    st.error("Please enter your email and password.")
+                else:
+                    patient = database.authenticate_patient(email, password)
+                    if patient:
+                        st.session_state.patient = database.get_patient(patient["patient_id"])
+                        st.session_state.health_assistant_messages = database.get_chat_history(patient["patient_id"])
+                        if st.session_state.active_view == "Login / Register":
+                            st.session_state.active_view = "AI Health Assistant"
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password.")
 
-            with chart_tab3:
-
-                st.line_chart(
-                    chart_df[["spo2"]],
-                    y_label="Oxygen saturation (%)"
-                )
-
-                st.line_chart(
-                    chart_df[["temperature"]],
-                    y_label="Temperature (°C)"
-                )
-
-            # ---------------- PERSONALIZED HEALTH ANALYTICS ----------------
-
-            st.divider()
-            st.subheader("Personalized Health Analytics")
-            st.caption(
-                "Summaries are calculated from your manually entered readings. "
-                "They describe changes in your records and are not medical assessments."
-            )
-
-            period_label = st.selectbox(
-                "Chart time period",
-                ["Last 7 days", "Last 30 days", "Last 90 days", "All available readings"],
-                index=1,
-                key="health_trend_period"
-            )
-
-            latest_timestamp = chart_df.index.max()
-            if period_label == "Last 7 days":
-                period_start = latest_timestamp - pd.Timedelta(days=7)
-            elif period_label == "Last 30 days":
-                period_start = latest_timestamp - pd.Timedelta(days=30)
-            elif period_label == "Last 90 days":
-                period_start = latest_timestamp - pd.Timedelta(days=90)
-            else:
-                period_start = chart_df.index.min()
-
-            period_df = chart_df.loc[chart_df.index >= period_start].copy()
-
-            if period_df.empty:
-                st.info("No readings are available in this selected period.")
-            else:
-                st.markdown("#### Selected-period averages")
-                average_columns = st.columns(5)
-                average_metrics = [
-                    ("Heart rate", "heart_rate", "BPM", 0),
-                    ("Systolic BP", "systolic_bp", "mmHg", 0),
-                    ("Diastolic BP", "diastolic_bp", "mmHg", 0),
-                    ("SpO2", "spo2", "%", 1),
-                    ("Temperature", "temperature", "°C", 1),
-                ]
-                for column, (label, field, unit, decimals) in zip(
-                    average_columns, average_metrics
-                ):
-                    average_value = period_df[field].mean()
-                    column.metric(
-                        label,
-                        f"{average_value:.{decimals}f} {unit}"
+        with register_tab:
+            with st.form("registration_form"):
+                full_name = st.text_input("Full Name")
+                email = st.text_input("Email Address")
+                col1, col2 = st.columns(2)
+                with col1:
+                    age = st.number_input("Age", min_value=1, max_value=120, value=20)
+                with col2:
+                    gender = st.selectbox(
+                        "Gender", ["Male", "Female", "Other", "Prefer not to say"]
                     )
 
-                st.caption(
-                    f"Based on {len(period_df)} reading(s), from "
-                    f"{period_df.index.min().strftime('%d %b %Y')} to "
-                    f"{period_df.index.max().strftime('%d %b %Y')}."
+                new_password = st.text_input("Create Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+
+                register_button = st.form_submit_button(
+                    "Create Account & Sign In", type="primary", use_container_width=True
                 )
 
-                st.markdown("#### Recent 7-day comparison")
-                latest_day = chart_df.index.max().normalize()
-                recent_start = latest_day - pd.Timedelta(days=6)
-                previous_start = latest_day - pd.Timedelta(days=13)
-                recent_week = chart_df.loc[
-                    (chart_df.index >= recent_start)
-                    & (chart_df.index < latest_day + pd.Timedelta(days=1))
-                ]
-                previous_week = chart_df.loc[
-                    (chart_df.index >= previous_start)
-                    & (chart_df.index < recent_start)
-                ]
+            if register_button:
+                if not full_name.strip() or not email.strip():
+                    st.error("Please fill in your name and email.")
+                elif "@" not in email or "." not in email.split("@")[-1]:
+                    st.error("Please enter a valid email address.")
+                elif new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                elif len(new_password) < 8:
+                    st.error("Password must contain at least 8 characters.")
+                else:
+                    success, result = database.register_patient(
+                        full_name=full_name, email=email, age=int(age),
+                        gender=gender, password=new_password
+                    )
+                    if success:
+                        st.session_state.patient = database.get_patient(result)
+                        st.session_state.health_assistant_messages = []
+                        if st.session_state.active_view == "Login / Register":
+                            st.session_state.active_view = "AI Health Assistant"
+                        st.rerun()
+                    else:
+                        st.error(result)
 
-                if previous_week.empty:
-                    st.info(
-                        "Add readings covering an earlier 7-day period to see "
-                        "a week-to-week comparison."
+
+# ---------------- CHATBOT (GEMINI / CHATGPT STYLE) ----------------
+
+def render_ai_assistant():
+    patient = st.session_state.patient
+    response_language = st.session_state.get("assistant_response_language", "Match my message")
+
+    prompt_from_chip = None
+    if not st.session_state.health_assistant_messages:
+        greeting_text = get_dynamic_greeting(patient)
+        st.markdown(f"""
+        <div class="welcome-box">
+            <h1>{html.escape(greeting_text)}</h1>
+            <p>How can I help with your health questions today? Ask in English, Hindi, or Hinglish.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _, chips_container, _ = st.columns([0.8, 3.4, 0.8])
+        with chips_container:
+            starter_prompts = [
+                "2 din se halka bukhaar aur thakan hai, kya care karun?",
+                "What do normal resting heart rate and BP numbers mean?",
+                "Warning signs when a common cold needs a doctor visit?"
+            ]
+            chip_cols = st.columns(3)
+            for idx, sample in enumerate(starter_prompts):
+                if chip_cols[idx].button(sample, use_container_width=True, key=f"starter_{idx}"):
+                    prompt_from_chip = sample
+
+    chat_box_input = st.chat_input("Ask AI Health Assistant...")
+    user_question = prompt_from_chip or chat_box_input
+
+    if user_question:
+        st.session_state.health_assistant_messages.append({"role": "user", "content": user_question})
+        if patient:
+            database.save_chat_message(patient["patient_id"], "user", user_question)
+        st.rerun()
+
+    for message in st.session_state.health_assistant_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if (
+        st.session_state.health_assistant_messages
+        and st.session_state.health_assistant_messages[-1]["role"] == "user"
+    ):
+        assistant_reply = ""
+        if not os.getenv("OPENROUTER_API_KEY"):
+            assistant_reply = (
+                "OpenRouter API key is not configured. Add `OPENROUTER_API_KEY=your_key` "
+                "to a `.env` file in the project folder or set it in your CMD window."
+            )
+            with st.chat_message("assistant"):
+                st.error(assistant_reply)
+        else:
+            if patient:
+                recent_health = database.get_health_history(patient["patient_id"])
+                if recent_health:
+                    latest_health = recent_health[0]
+                    health_context = (
+                        "Latest manually entered readings (not live sensor data): "
+                        f"heart rate {latest_health.get('heart_rate')} BPM; "
+                        f"blood pressure {latest_health.get('systolic_bp')}/"
+                        f"{latest_health.get('diastolic_bp')} mmHg; "
+                        f"SpO2 {latest_health.get('spo2')}%; "
+                        f"temperature {latest_health.get('temperature')} °C; "
+                        f"recorded at {latest_health.get('recorded_at')}."
                     )
                 else:
-                    comparison_columns = st.columns(5)
-                    for column, (label, field, unit, decimals) in zip(
-                        comparison_columns, average_metrics
-                    ):
-                        current_average = (
-                            recent_week[field].mean() if not recent_week.empty else None
-                        )
-                        previous_average = previous_week[field].mean()
-                        if current_average is None or pd.isna(current_average):
-                            column.metric(label, "No recent data")
-                        else:
-                            difference = current_average - previous_average
-                            column.metric(
-                                label,
-                                f"{current_average:.{decimals}f} {unit}",
-                                delta=f"{difference:+.{decimals}f} {unit} vs prior 7 days",
-                                delta_color="off"
-                            )
+                    health_context = "No saved health readings are available."
 
-                    st.caption(
-                        "The comparison is descriptive only. An increase or decrease "
-                        "is not automatically good or bad; interpret readings with a "
-                        "qualified healthcare professional."
-                    )
-
-                st.markdown("#### Trends for selected period")
-                selected_chart = period_df[
-                    ["heart_rate", "systolic_bp", "diastolic_bp", "spo2", "temperature"]
-                ]
-                trend_tab1, trend_tab2, trend_tab3 = st.tabs([
-                    "Heart Rate & BP", "SpO2", "Temperature"
-                ])
-                with trend_tab1:
-                    st.line_chart(
-                        selected_chart[["heart_rate"]],
-                        y_label="Beats per minute"
-                    )
-                    st.line_chart(
-                        selected_chart[["systolic_bp", "diastolic_bp"]],
-                        y_label="mmHg"
-                    )
-                with trend_tab2:
-                    st.line_chart(
-                        selected_chart[["spo2"]],
-                        y_label="Oxygen saturation (%)"
-                    )
-                with trend_tab3:
-                    st.line_chart(
-                        selected_chart[["temperature"]],
-                        y_label="Temperature (°C)"
-                    )
-
-            st.markdown("#### All Saved Health Readings")
-
-            display_df = pd.DataFrame(health_history)
-
-            display_df["recorded_at"] = pd.to_datetime(
-                display_df["recorded_at"], utc=True
-            ).dt.strftime("%d %b %Y, %I:%M %p UTC")
-
-            display_df = display_df.rename(columns={
-                "heart_rate": "Heart Rate (BPM)",
-                "systolic_bp": "Systolic (mmHg)",
-                "diastolic_bp": "Diastolic (mmHg)",
-                "spo2": "SpO2 (%)",
-                "temperature": "Temperature (°C)",
-                "recorded_at": "Recorded At"
-            })
-
-            st.dataframe(
-                display_df[
-                    [
-                        "Recorded At",
-                        "Heart Rate (BPM)",
-                        "Systolic (mmHg)",
-                        "Diastolic (mmHg)",
-                        "SpO2 (%)",
-                        "Temperature (°C)"
+                recent_predictions = database.get_prediction_history(patient["patient_id"])
+                if recent_predictions:
+                    prediction_lines = [
+                        f"Symptoms entered: {item.get('symptoms', 'Not available')}; "
+                        f"educational ML output: {item.get('predicted_class', 'Not available')}; "
+                        f"recorded at: {item.get('recorded_at', 'Not available')}"
+                        for item in recent_predictions[:3]
                     ]
-                ],
-                use_container_width=True,
-                hide_index=True
-            )
+                    prediction_context = "Recent educational prediction history: " + " | ".join(prediction_lines)
+                else:
+                    prediction_context = "No saved model predictions are available."
 
-        else:
+                context_message = (
+                    "Limited context from the logged-in patient's local dashboard. Do not repeat "
+                    "identifying details; none are supplied. "
+                    + health_context + " " + prediction_context
+                )
+            else:
+                context_message = (
+                    "The user is currently chatting as an unauthenticated guest. "
+                    "No saved health readings or prediction history are linked to this session."
+                )
 
-            st.info(
-                "No health readings found. Enter your first reading "
-                "using the form above."
-            )
+            language_instruction = {
+                "Match my message": "Reply in the same language and style as the user's latest message.",
+                "English": "Reply in simple English.",
+                "Hindi": "Reply in simple Hindi using Devanagari script.",
+                "Hinglish": "Reply in simple conversational Hinglish using Latin script."
+            }[response_language]
 
-    # ---------------- DISEASE PREDICTION ----------------
+            system_prompt = f"""
+You are an educational AI Health Assistant in a college academic prototype.
+{language_instruction}
 
-    with prediction_tab:
+For each health-related question, use these headings when relevant:
+1. **Understanding your concern** - briefly restate the question or symptoms without adding symptoms.
+2. **General information** - explain possible general meanings; do not identify a definite disease.
+3. **General self-care** - give low-risk, non-medicine guidance only when appropriate. Do not recommend prescription or OTC medicines, dosages, or treatment plans.
+4. **When to seek medical help** - explain when the user should contact a qualified healthcare professional.
+5. **Urgent warning** - if the user describes chest pain, severe breathing difficulty, fainting/unconsciousness, stroke signs, severe allergic reaction, heavy bleeding, or another immediate danger, tell them to seek local emergency medical help now. Do not delay urgent care for further chat.
 
+Safety rules:
+- Never diagnose, prescribe, recommend medicine dosages, or claim certainty.
+- Do not treat the project's machine-learning output as a diagnosis or medical evidence.
+- Dashboard readings are manually entered and may be inaccurate; do not infer a diagnosis from them.
+- Explain that a single reading cannot establish a medical condition.
+- Do not falsely reassure or say a person is safe based only on this limited context.
+- Do not request personally identifying information.
+- Keep the response clear, concise and practical. If the question is not medical, answer normally and briefly.
+- This is an academic prototype, not a medical device.
+"""
+
+            with st.chat_message("assistant"):
+                thinking_phrases = [
+                    "Thinking...",
+                    "Reading your question...",
+                    "Checking health references...",
+                    "Connecting the dots...",
+                    "Putting together a clear response...",
+                    "Almost there..."
+                ]
+                status_box = st.empty()
+                try:
+                    chat_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "system", "content": context_message},
+                        *[
+                            {"role": item["role"], "content": item["content"]}
+                            for item in st.session_state.health_assistant_messages[-10:]
+                        ]
+                    ]
+                    assistant_reply = ask_ai_with_live_status(
+                        chat_messages, status_box, thinking_phrases, temperature=0.3
+                    )
+                    st.markdown(assistant_reply)
+                except Exception as exc:
+                    status_box.empty()
+                    assistant_reply = (
+                        "The AI service could not respond right now. Please try again "
+                        "later. Technical detail: " + str(exc)
+                    )
+                    st.error(assistant_reply)
+
+        st.session_state.health_assistant_messages.append(
+            {"role": "assistant", "content": assistant_reply}
+        )
+        if patient and assistant_reply:
+            database.save_chat_message(patient["patient_id"], "assistant", assistant_reply)
+
+
+# ---------------- DISEASE PREDICTION VIEW ----------------
+
+def render_disease_prediction():
+    _, main_col, _ = st.columns([0.6, 3, 0.6])
+    with main_col:
+        patient = st.session_state.patient
         st.subheader("AI Disease Prediction")
+
+        if not patient:
+            st.info("Guest Mode — Sign in anytime to save results to your history.")
 
         if not MODEL_PATH.exists():
             st.error("Disease prediction model not found.")
-            st.stop()
+            return
 
         model = load_model()
         features = list(model.feature_names_in_)
 
-        st.caption(
-            "Describe your symptoms in English or Hinglish, "
-            "or select them manually."
-        )
+        st.caption("Describe your symptoms in English or Hinglish, or select them manually.")
 
         description = st.text_area(
             "Describe your symptoms",
@@ -973,17 +795,11 @@ def patient_dashboard():
         )
 
         with st.expander("Select Symptoms Manually"):
-
-            search = st.text_input(
-                "Search symptoms",
-                key="symptom_search"
-            )
-
+            search = st.text_input("Search symptoms", key="symptom_search")
             filtered_features = [
                 feature for feature in features
                 if search.lower() in feature.lower()
             ]
-
             selected = st.multiselect(
                 "Choose symptoms",
                 options=filtered_features,
@@ -994,6 +810,7 @@ def patient_dashboard():
             selected_symptoms = set(selected)
             extracted_symptoms = set()
             extraction_uncertain = False
+            extraction_message = ""
 
             if description.strip():
                 if not os.getenv("OPENROUTER_API_KEY"):
@@ -1001,8 +818,9 @@ def patient_dashboard():
                         "OpenRouter API key is missing. Set OPENROUTER_API_KEY "
                         "in the same CMD window used to launch Streamlit."
                     )
-                    st.stop()
+                    return
 
+                response_language = st.session_state.get("assistant_response_language", "Match my message")
                 prompt = f"""
 You are a strict symptom phrase matcher for a college demonstration.
 The patient may describe symptoms in English, Hindi, or Hinglish written
@@ -1023,6 +841,7 @@ Important:
 3. Match only exact labels from the allowed labels below.
 4. If a phrase does not clearly match an exact label, omit it and set uncertain=true.
 5. Return valid JSON only, with no markdown or explanation.
+6. Also include a "message" key in the JSON with a very brief, friendly confirmation of the extracted symptoms in {response_language}.
 
 Allowed exact symptom labels:
 {", ".join(features)}
@@ -1031,45 +850,29 @@ Patient description:
 {description}
 
 Required JSON format:
-{{"symptoms": ["exact_label_1", "exact_label_2"], "uncertain": false}}
+{{"symptoms": ["exact_label_1", "exact_label_2"], "uncertain": false, "message": "..."}}
 """
-
                 try:
-                    client = OpenAI(
-                        api_key=os.environ["OPENROUTER_API_KEY"],
-                        base_url="https://openrouter.ai/api/v1"
-                    )
-                    response = client.chat.completions.create(
-                        model="openrouter/free",
-                        messages=[
+                    raw = ask_ai(
+                        [
                             {
                                 "role": "system",
-                                "content": (
-                                    "You extract all explicitly stated symptoms "
-                                    "from English, Hindi and Hinglish. Return JSON only."
-                                )
+                                "content": "You extract explicitly stated symptoms into JSON."
                             },
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0
-                    )
+                    ).strip()
 
-                    raw = (response.choices[0].message.content or "").strip()
-                    raw = re.sub(
-                        r"^```(?:json)?\\s*|\\s*```$",
-                        "",
-                        raw,
-                        flags=re.IGNORECASE
-                    )
+                    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
                     result = json.loads(raw)
 
                     extracted_symptoms = {
-                        symptom.strip()
-                        for symptom in result.get("symptoms", [])
-                        if isinstance(symptom, str)
-                        and symptom.strip() in features
+                        symptom.strip() for symptom in result.get("symptoms", [])
+                        if isinstance(symptom, str) and symptom.strip() in features
                     }
                     extraction_uncertain = bool(result.get("uncertain", False))
+                    extraction_message = result.get("message", "")
 
                 except Exception as exc:
                     st.error(
@@ -1082,11 +885,15 @@ Required JSON format:
             st.session_state["pending_symptoms"] = combined
             st.session_state["pending_symptom_description"] = description.strip()
             st.session_state["pending_symptom_uncertain"] = extraction_uncertain
+            st.session_state["pending_symptom_message"] = extraction_message
 
         if "pending_symptoms" in st.session_state:
             pending = st.session_state["pending_symptoms"]
 
             st.divider()
+            if st.session_state.get("pending_symptom_message"):
+                st.info(st.session_state["pending_symptom_message"])
+
             st.subheader("Confirm Extracted Symptoms")
             st.caption(
                 "Review the symptoms below. Untick anything that does not apply "
@@ -1114,7 +921,6 @@ Required JSON format:
                 )
 
                 confirm_col, cancel_col = st.columns(2)
-
                 with confirm_col:
                     predict_now = st.button(
                         "Confirm Symptoms & Predict",
@@ -1122,7 +928,6 @@ Required JSON format:
                         key="confirm_symptoms_predict",
                         use_container_width=True
                     )
-
                 with cancel_col:
                     cancel_prediction = st.button(
                         "Cancel",
@@ -1132,9 +937,8 @@ Required JSON format:
 
                 if cancel_prediction:
                     for key in [
-                        "pending_symptoms",
-                        "pending_symptom_description",
-                        "pending_symptom_uncertain",
+                        "pending_symptoms", "pending_symptom_description", 
+                        "pending_symptom_uncertain", "pending_symptom_message", 
                         "confirmed_symptoms"
                     ]:
                         st.session_state.pop(key, None)
@@ -1154,11 +958,8 @@ Required JSON format:
                         model = load_model()
                         prediction = str(model.predict(input_df)[0]).strip()
 
-                        # Technical uncertainty checks. These are safeguards for
-                        # an academic demo, not clinically validated thresholds.
                         top_score = None
                         score_margin = None
-                        probabilities = None
                         top_predictions = []
                         if hasattr(model, "predict_proba"):
                             probabilities = model.predict_proba(input_df)[0]
@@ -1177,9 +978,6 @@ Required JSON format:
                             if len(ranked_scores) > 1:
                                 score_margin = ranked_scores[0] - ranked_scores[1]
 
-                        # Check whether the exact confirmed symptom combination
-                        # occurs in the original training data for the predicted
-                        # class. This is dataset support, not medical evidence.
                         training_path = BASE_DIR / "dataset" / "Training.csv"
                         matching_rows = 0
                         predicted_class_matches = 0
@@ -1189,37 +987,25 @@ Required JSON format:
                             try:
                                 training_df = pd.read_csv(training_path)
                                 if "prognosis" in training_df.columns and all(
-                                    symptom in training_df.columns
-                                    for symptom in all_symptoms
+                                    symptom in training_df.columns for symptom in all_symptoms
                                 ):
                                     training_check_available = True
-                                    symptom_mask = pd.Series(
-                                        True, index=training_df.index
-                                    )
+                                    symptom_mask = pd.Series(True, index=training_df.index)
                                     for symptom in all_symptoms:
                                         symptom_mask &= (
-                                            pd.to_numeric(
-                                                training_df[symptom],
-                                                errors="coerce"
-                                            ).fillna(0) == 1
+                                            pd.to_numeric(training_df[symptom], errors="coerce").fillna(0) == 1
                                         )
 
                                     matching = training_df[symptom_mask]
                                     matching_rows = len(matching)
                                     predicted_class_matches = int(
-                                        matching["prognosis"]
-                                        .astype(str).str.strip()
-                                        .eq(prediction).sum()
+                                        matching["prognosis"].astype(str).str.strip().eq(prediction).sum()
                                     )
                             except Exception:
                                 training_check_available = False
 
-                        # Conservative UI gate: never present a disease label as
-                        # a supported result if the original training data has no
-                        # row containing all confirmed symptoms for that class.
                         unsupported_by_training = (
-                            training_check_available
-                            and predicted_class_matches == 0
+                            training_check_available and predicted_class_matches == 0
                         )
                         weak_model_support = (
                             top_score is not None and top_score < 0.50
@@ -1236,8 +1022,7 @@ Required JSON format:
                         st.write("**Confirmed symptoms used for prediction:**")
                         st.write(
                             ", ".join(
-                                symptom.replace("_", " ").title()
-                                for symptom in sorted(all_symptoms)
+                                symptom.replace("_", " ").title() for symptom in sorted(all_symptoms)
                             )
                         )
 
@@ -1270,511 +1055,398 @@ Required JSON format:
                                 f"{score_margin * 100:.1f} percentage points."
                             )
 
-                        # Explainable AI: show model ranking and global feature
-                        # importance for the symptoms selected in this case.
                         with st.expander("Explainable AI — understand the model output"):
                             st.markdown("**Top three model-ranked classes**")
                             if top_predictions:
-                                ranking_df = pd.DataFrame(
-                                    [
-                                        {
-                                            "Model-ranked class": label,
-                                            "Relative model score": f"{score * 100:.1f}%"
-                                        }
-                                        for label, score in top_predictions
-                                    ]
-                                )
-                                st.dataframe(
-                                    ranking_df,
-                                    use_container_width=True,
-                                    hide_index=True
-                                )
-                                st.caption(
-                                    "These are Random Forest score shares, not "
-                                    "medical probabilities or disease risks."
-                                )
-                            else:
-                                st.info(
-                                    "This model does not expose class scores, so "
-                                    "a ranked score explanation is unavailable."
-                                )
+                                ranking_df = pd.DataFrame([
+                                    {
+                                        "Model-ranked class": label,
+                                        "Relative model score": f"{score * 100:.1f}%"
+                                    }
+                                    for label, score in top_predictions
+                                ])
+                                st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
                             if hasattr(model, "feature_importances_"):
                                 importance_values = list(model.feature_importances_)
-                                model_features = list(
-                                    getattr(model, "feature_names_in_", features)
-                                )
+                                model_features = list(getattr(model, "feature_names_in_", features))
                                 importance_map = {
                                     str(name): float(value)
-                                    for name, value in zip(
-                                        model_features, importance_values
-                                    )
+                                    for name, value in zip(model_features, importance_values)
                                 }
                                 selected_importance = [
                                     {
-                                        "Confirmed symptom": symptom.replace(
-                                            "_", " "
-                                        ).title(),
-                                        "Global model importance": (
-                                            importance_map.get(symptom, 0.0) * 100
-                                        )
+                                        "Confirmed symptom": symptom.replace("_", " ").title(),
+                                        "Global model importance": importance_map.get(symptom, 0.0) * 100
                                     }
                                     for symptom in sorted(all_symptoms)
                                 ]
                                 selected_importance.sort(
-                                    key=lambda item: item["Global model importance"],
-                                    reverse=True
-                                )
-
-                                st.markdown(
-                                    "**Global importance of your confirmed symptoms**"
+                                    key=lambda item: item["Global model importance"], reverse=True
                                 )
                                 if selected_importance:
-                                    importance_df = pd.DataFrame(
-                                        selected_importance
-                                    )
-                                    importance_df[
-                                        "Global model importance"
-                                    ] = importance_df[
+                                    importance_df = pd.DataFrame(selected_importance)
+                                    importance_df["Global model importance"] = importance_df[
                                         "Global model importance"
                                     ].map(lambda value: f"{value:.3f}%")
-                                    st.dataframe(
-                                        importance_df,
-                                        use_container_width=True,
-                                        hide_index=True
-                                    )
-                                else:
-                                    st.info("No confirmed symptoms to explain.")
-
-                                st.caption(
-                                    "Feature importance describes how the trained "
-                                    "Random Forest used features across its training "
-                                    "process. It is not a case-specific causal "
-                                    "explanation and does not mean a symptom caused "
-                                    "the predicted class."
-                                )
-
-                                global_top = sorted(
-                                    importance_map.items(),
-                                    key=lambda item: item[1],
-                                    reverse=True
-                                )[:10]
-                                with st.expander(
-                                    "View the model's 10 most important features"
-                                ):
-                                    global_df = pd.DataFrame(
-                                        [
-                                            {
-                                                "Feature": name.replace(
-                                                    "_", " "
-                                                ).title(),
-                                                "Global importance": f"{value * 100:.3f}%"
-                                            }
-                                            for name, value in global_top
-                                        ]
-                                    )
-                                    st.dataframe(
-                                        global_df,
-                                        use_container_width=True,
-                                        hide_index=True
-                                    )
-                            else:
-                                st.info(
-                                    "This model does not expose built-in feature "
-                                    "importance. A feature-level explanation is "
-                                    "not available for this model."
-                                )
+                                    st.dataframe(importance_df, use_container_width=True, hide_index=True)
 
                         if training_check_available:
                             st.caption(
-                                f"Original training rows containing all selected "
-                                f"symptoms: {matching_rows}; rows in the predicted "
-                                f"class: {predicted_class_matches}."
+                                f"Original training rows containing all selected symptoms: {matching_rows}; "
+                                f"rows in the predicted class: {predicted_class_matches}."
                             )
-                            if unsupported_by_training:
-                                st.warning(
-                                    "The original training dataset contains no row "
-                                    "with all selected symptoms labelled as the "
-                                    "model's top-ranked class."
-                                )
-                        else:
-                            st.caption(
-                                "Training-pattern cross-check was unavailable; "
-                                "the system cannot verify support from the original dataset."
-                            )
-
-                        st.warning(
-                            "Academic prototype only. Model scores and dataset "
-                            "matches are not medical evidence, diagnosis, or treatment advice. "
-                            "Consult a qualified healthcare professional for health concerns."
-                        )
 
                         history_label = (
-                            "Insufficient reliable support (top-ranked: "
-                            + prediction + ")"
-                            if uncertain_result
-                            else prediction
+                            "Insufficient reliable support (top-ranked: " + prediction + ")"
+                            if uncertain_result else prediction
                         )
-                        database.save_prediction(
-                            patient["patient_id"],
-                            ", ".join(sorted(all_symptoms)),
-                            history_label
-                        )
-                        st.success("Result saved to your patient history.")
+
+                        if patient:
+                            database.save_prediction(
+                                patient["patient_id"],
+                                ", ".join(sorted(all_symptoms)),
+                                history_label
+                            )
+                            st.success("Result saved to your patient history.")
+                        else:
+                            st.info("Sign in anytime if you want to save predictions to your personal history.")
 
                         for key in [
-                            "pending_symptoms",
-                            "pending_symptom_description",
-                            "pending_symptom_uncertain",
+                            "pending_symptoms", "pending_symptom_description", 
+                            "pending_symptom_uncertain", "pending_symptom_message", 
                             "confirmed_symptoms"
                         ]:
                             st.session_state.pop(key, None)
 
-    # ---------------- ML MODEL BENCHMARKING ----------------
 
-    with benchmark_tab:
+# ---------------- HEALTH MONITORING VIEW (REQUIRES LOGIN) ----------------
 
+def render_health_monitoring():
+    patient = st.session_state.patient
+    if not patient:
+        render_authentication_view(
+            "Sign in or register to log your vital signs, view health trend charts, and track weekly changes."
+        )
+        return
+
+    _, main_col, _ = st.columns([0.6, 3, 0.6])
+    with main_col:
+        st.subheader("Smart Health Monitoring")
+        st.caption(
+            "Enter your health readings below. These are manually entered measurements, not live sensor readings."
+        )
+
+        with st.form("health_reading_form"):
+            st.markdown("#### Heart Rate")
+            heart_rate = st.number_input("Heart Rate (BPM)", min_value=40, max_value=180, value=75)
+
+            st.markdown("#### Blood Pressure")
+            col1, col2 = st.columns(2)
+            with col1:
+                systolic = st.number_input("Systolic Pressure (mmHg)", min_value=60, max_value=250, value=120)
+            with col2:
+                diastolic = st.number_input("Diastolic Pressure (mmHg)", min_value=30, max_value=150, value=80)
+
+            st.markdown("#### Oxygen Saturation")
+            spo2 = st.number_input("SpO2 (%)", min_value=50, max_value=100, value=98)
+
+            st.markdown("#### Body Temperature")
+            temperature = st.number_input(
+                "Temperature (°C)", min_value=30.0, max_value=45.0, value=36.8, step=0.1, format="%.1f"
+            )
+
+            save_reading = st.form_submit_button("Save Health Reading", type="primary", use_container_width=True)
+
+        if save_reading:
+            if systolic <= diastolic:
+                st.error("Systolic pressure should be higher than diastolic pressure. Please verify your readings.")
+            else:
+                database.save_health_reading(
+                    patient_id=patient["patient_id"], heart_rate=float(heart_rate),
+                    systolic_bp=float(systolic), diastolic_bp=float(diastolic),
+                    spo2=float(spo2), temperature=float(temperature)
+                )
+                st.session_state["health_reading_saved"] = True
+                st.rerun()
+
+        if st.session_state.get("health_reading_saved", False):
+            st.success("Health reading saved successfully!")
+            st.session_state["health_reading_saved"] = False
+
+        st.divider()
+        st.subheader("Latest Health Readings")
+
+        health_history = database.get_health_history(patient["patient_id"])
+        if health_history:
+            latest = health_history[0]
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Heart Rate", f"{latest['heart_rate']:.0f} BPM")
+            col2.metric("Blood Pressure", f"{latest['systolic_bp']:.0f}/{latest['diastolic_bp']:.0f} mmHg")
+            col3.metric("SpO2", f"{latest['spo2']:.0f}%")
+
+            col4, col5 = st.columns(2)
+            col4.metric("Temperature", f"{latest['temperature']:.1f} °C")
+            col5.metric(
+                "Recorded",
+                pd.to_datetime(latest["recorded_at"], utc=True).strftime("%d %b %Y, %I:%M %p UTC")
+            )
+
+            warnings, notes = get_health_warnings(
+                latest["heart_rate"], latest["systolic_bp"], latest["diastolic_bp"],
+                latest["spo2"], latest["temperature"]
+            )
+            st.markdown("#### Health Reading Review")
+            if warnings:
+                for warning in warnings:
+                    st.warning(warning)
+            else:
+                for note in notes:
+                    st.success(note)
+
+            st.divider()
+            st.subheader("Health Trends")
+            chart_df = pd.DataFrame(health_history)
+            chart_df["recorded_at"] = pd.to_datetime(chart_df["recorded_at"], utc=True)
+            chart_df = chart_df.sort_values("recorded_at").set_index("recorded_at")
+
+            chart_tab1, chart_tab2, chart_tab3 = st.tabs(["Heart Rate", "Blood Pressure", "SpO2 & Temperature"])
+            with chart_tab1:
+                st.line_chart(chart_df[["heart_rate"]], y_label="Beats per minute")
+            with chart_tab2:
+                st.line_chart(chart_df[["systolic_bp", "diastolic_bp"]], y_label="mmHg")
+            with chart_tab3:
+                st.line_chart(chart_df[["spo2"]], y_label="Oxygen saturation (%)")
+                st.line_chart(chart_df[["temperature"]], y_label="Temperature (°C)")
+
+            st.markdown("#### All Saved Health Readings")
+            display_df = pd.DataFrame(health_history)
+            display_df["recorded_at"] = pd.to_datetime(display_df["recorded_at"], utc=True).dt.strftime(
+                "%d %b %Y, %I:%M %p UTC"
+            )
+            display_df = display_df.rename(columns={
+                "heart_rate": "Heart Rate (BPM)", "systolic_bp": "Systolic (mmHg)",
+                "diastolic_bp": "Diastolic (mmHg)", "spo2": "SpO2 (%)",
+                "temperature": "Temperature (°C)", "recorded_at": "Recorded At"
+            })
+            st.dataframe(
+                display_df[[
+                    "Recorded At", "Heart Rate (BPM)", "Systolic (mmHg)",
+                    "Diastolic (mmHg)", "SpO2 (%)", "Temperature (°C)"
+                ]],
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("No health readings found. Enter your first reading using the form above.")
+
+
+# ---------------- HISTORY & PDF REPORT (REQUIRES LOGIN) ----------------
+
+def render_history_and_report():
+    patient = st.session_state.patient
+    if not patient:
+        render_authentication_view(
+            "Sign in or register to access your saved prediction history and download PDF health reports."
+        )
+        return
+
+    _, main_col, _ = st.columns([0.6, 3, 0.6])
+    with main_col:
+        history_tab, report_tab, profile_tab = st.tabs([
+            "Prediction History",
+            "PDF Health Report",
+            "Patient Profile"
+        ])
+
+        with history_tab:
+            st.subheader("Your Previous Predictions")
+            history = database.get_prediction_history(patient["patient_id"])
+            if history:
+                history_df = pd.DataFrame(history).rename(columns={
+                    "predicted_class": "Predicted Result",
+                    "symptoms": "Symptoms",
+                    "recorded_at": "Date and Time"
+                })
+                st.dataframe(
+                    history_df[["Date and Time", "Symptoms", "Predicted Result"]],
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.info("No prediction history yet.")
+
+        with report_tab:
+            st.subheader("Downloadable Patient Health Report")
+            report_health = database.get_health_history(patient["patient_id"])
+            report_predictions = database.get_prediction_history(patient["patient_id"])
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Saved health readings", len(report_health))
+            col2.metric("Saved predictions", len(report_predictions))
+            col3.metric("Readings included", min(len(report_health), 30))
+
+            if st.button("Generate PDF Health Report", type="primary"):
+                try:
+                    pdf_bytes = build_patient_health_pdf(patient, report_health, report_predictions)
+                    st.session_state["patient_health_pdf"] = pdf_bytes
+                    st.success("Your PDF report is ready.")
+                except Exception as exc:
+                    st.error(f"Could not generate the PDF report: {exc}")
+
+            if st.session_state.get("patient_health_pdf"):
+                patient_code = re.sub(
+                    r"[^A-Za-z0-9_-]", "_", str(patient.get("patient_id", "patient"))
+                )
+                st.download_button(
+                    label="Download Patient Health Report (PDF)",
+                    data=st.session_state["patient_health_pdf"],
+                    file_name=f"health_report_{patient_code}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+
+        with profile_tab:
+            st.subheader("Your Patient Profile")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Patient ID", patient["patient_id"])
+            col2.metric("Age", patient["age"])
+            col3.metric("Gender", patient["gender"])
+
+            safe_name = html.escape(str(patient["full_name"]))
+            safe_email = html.escape(str(patient["email"]))
+            safe_id = html.escape(str(patient["patient_id"]))
+            st.markdown(
+                f"""
+                <div class="patient-card">
+                    <h4>Personal Information</h4>
+                    <p><b>Name:</b> {safe_name}</p>
+                    <p><b>Email:</b> {safe_email}</p>
+                    <p><b>Patient ID:</b> {safe_id}</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+# ---------------- ML BENCHMARKING VIEW ----------------
+
+def render_ml_benchmark():
+    _, main_col, _ = st.columns([0.6, 3, 0.6])
+    with main_col:
         st.subheader("Machine Learning Model Benchmarking")
         st.caption(
-            "Compare standard classifiers using stratified cross-validation "
-            "on the original Training.csv dataset."
+            "Compare standard classifiers using stratified cross-validation on the original Training.csv dataset."
         )
 
-        st.warning(
-            "This is an academic benchmark, not clinical validation. "
-            "Results depend on the dataset and may be optimistic if records "
-            "contain duplicated or highly similar symptom patterns."
-        )
-
-        if st.button(
-            "Run 5-fold model comparison",
-            type="primary",
-            key="run_ml_benchmark"
-        ):
+        if st.button("Run 5-fold model comparison", type="primary", key="run_ml_benchmark"):
             try:
-                with st.spinner(
-                    "Training and evaluating six models. This may take a few minutes..."
-                ):
-                    benchmark_df, row_count, feature_count, class_count, fold_count = (
-                        run_model_benchmark()
-                    )
+                with st.spinner("Training and evaluating six models. This may take a few minutes..."):
+                    benchmark_df, row_count, feature_count, class_count, fold_count = run_model_benchmark()
                 st.session_state["ml_benchmark_result"] = {
-                    "table": benchmark_df,
-                    "rows": row_count,
-                    "features": feature_count,
-                    "classes": class_count,
-                    "folds": fold_count,
+                    "table": benchmark_df, "rows": row_count, "features": feature_count,
+                    "classes": class_count, "folds": fold_count,
                 }
             except Exception as exc:
                 st.error(f"Benchmark could not be completed: {exc}")
 
         benchmark_result = st.session_state.get("ml_benchmark_result")
         if benchmark_result:
-            st.markdown("#### Dataset overview")
             metric_cols = st.columns(4)
             metric_cols[0].metric("Training records", benchmark_result["rows"])
             metric_cols[1].metric("Features", benchmark_result["features"])
             metric_cols[2].metric("Disease classes", benchmark_result["classes"])
             metric_cols[3].metric("CV folds", benchmark_result["folds"])
 
-            st.markdown("#### Cross-validation results")
             display_df = benchmark_result["table"].copy()
-            metric_columns = [
-                "Accuracy", "Precision (macro)", "Recall (macro)",
-                "F1-score (macro)", "F1 std."
-            ]
-            for column in metric_columns:
-                display_df[column] = display_df[column].map(
-                    lambda value: f"{value * 100:.2f}%"
-                )
+            for column in ["Accuracy", "Precision (macro)", "Recall (macro)", "F1-score (macro)", "F1 std."]:
+                display_df[column] = display_df[column].map(lambda value: f"{value * 100:.2f}%")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             chart_df = benchmark_result["table"].set_index("Model")[
                 ["Accuracy", "Precision (macro)", "Recall (macro)", "F1-score (macro)"]
             ]
-            st.markdown("#### Visual model comparison")
             st.bar_chart(chart_df)
 
-            best_model = benchmark_result["table"].iloc[0]
-            st.info(
-                f"Highest macro F1 in this run: {best_model['Model']} "
-                f"({best_model['F1-score (macro)'] * 100:.2f}%). "
-                "This does not automatically mean it is the best model for "
-                "real-world medical use."
-            )
 
-            st.caption(
-                "The benchmark trains fresh baseline models using stratified "
-                "cross-validation. It does not replace your deployed Random "
-                "Forest model. The separate Testing.csv file is not used in "
-                "this cross-validation comparison."
-            )
-        else:
-            st.info(
-                "Click the button above to run the benchmark. Results are "
-                "cached for this app session to avoid unnecessary repeated training."
-            )
+# ---------------- COLLAPSIBLE SIDEBAR (CHATGPT / GEMINI / CLAUDE STYLE) ----------------
 
-    # ---------------- AI HEALTH ASSISTANT ----------------
+with st.sidebar:
+    st.markdown("### 🏥 AI Health Monitor")
 
-    with assistant_tab:
+    if st.button("➕ New Chat", use_container_width=True, type="primary"):
+        st.session_state.health_assistant_messages = []
+        if st.session_state.patient:
+            database.clear_chat_history(st.session_state.patient["patient_id"])
+        
+        if st.session_state.active_view != "AI Health Assistant":
+            for key in [
+                "pending_symptoms", "pending_symptom_description", 
+                "pending_symptom_uncertain", "pending_symptom_message", 
+                "confirmed_symptoms"
+            ]:
+                st.session_state.pop(key, None)
+        
+        st.session_state.active_view = "AI Health Assistant"
+        st.rerun()
 
-        st.subheader("AI Health Assistant")
-        st.caption(
-            "Get general health information, a simple summary of your question, "
-            "home-care information and guidance on when to seek medical attention."
-        )
+    st.divider()
 
-        st.info(
-            "Privacy reminder: Do not enter your name, email, patient ID, address, "
-            "or other identifying information. Your question and limited dashboard "
-            "context are sent to OpenRouter, an external AI service."
-        )
+    nav_items = [
+        ("💬 AI Health Assistant", "AI Health Assistant"),
+        ("🩺 Disease Prediction", "Disease Prediction"),
+        ("💓 Health Monitoring", "Health Monitoring"),
+        ("📄 Records & PDF Report", "Records & PDF Report"),
+        ("📊 ML Benchmarking", "ML Benchmarking"),
+    ]
 
-        response_language = st.selectbox(
-            "Response language",
-            ["Match my message", "English", "Hindi", "Hinglish"],
-            key="assistant_response_language"
-        )
+    for label, view_name in nav_items:
+        is_active = st.session_state.active_view == view_name
+        if st.button(
+            label,
+            use_container_width=True,
+            type="secondary" if not is_active else "primary",
+            key=f"nav_{view_name}"
+        ):
+            if st.session_state.active_view != view_name:
+                for key in [
+                    "pending_symptoms", "pending_symptom_description", 
+                    "pending_symptom_uncertain", "pending_symptom_message", 
+                    "confirmed_symptoms"
+                ]:
+                    st.session_state.pop(key, None)
+            st.session_state.active_view = view_name
+            st.rerun()
 
-        st.caption(
-            "The assistant provides educational information only. It cannot diagnose, "
-            "prescribe medicines or replace a qualified healthcare professional."
-        )
+    st.divider()
 
-        if "health_assistant_messages" not in st.session_state:
-            st.session_state.health_assistant_messages = []
-
-        for message in st.session_state.health_assistant_messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-        user_question = st.chat_input(
-            "Ask a general health question (English, Hindi or Hinglish)..."
-        )
-
-        if user_question:
-            st.session_state.health_assistant_messages.append(
-                {"role": "user", "content": user_question}
-            )
-
-            with st.chat_message("user"):
-                st.markdown(user_question)
-
-            if not os.getenv("OPENROUTER_API_KEY"):
-                assistant_reply = (
-                    "OpenRouter API key is not configured. Set "
-                    "OPENROUTER_API_KEY in the CMD window used to launch Streamlit."
-                )
-                with st.chat_message("assistant"):
-                    st.error(assistant_reply)
-            else:
-                recent_health = database.get_health_history(patient["patient_id"])
-                if recent_health:
-                    latest_health = recent_health[0]
-                    health_context = (
-                        "Latest manually entered readings (not live sensor data): "
-                        f"heart rate {latest_health.get('heart_rate')} BPM; "
-                        f"blood pressure {latest_health.get('systolic_bp')}/"
-                        f"{latest_health.get('diastolic_bp')} mmHg; "
-                        f"SpO2 {latest_health.get('spo2')}%; "
-                        f"temperature {latest_health.get('temperature')} °C; "
-                        f"recorded at {latest_health.get('recorded_at')}."
-                    )
-                else:
-                    health_context = "No saved health readings are available."
-
-                recent_predictions = database.get_prediction_history(
-                    patient["patient_id"]
-                )
-                if recent_predictions:
-                    prediction_lines = []
-                    for item in recent_predictions[:3]:
-                        prediction_lines.append(
-                            f"Symptoms entered: {item.get('symptoms', 'Not available')}; "
-                            f"educational ML output: {item.get('predicted_class', 'Not available')}; "
-                            f"recorded at: {item.get('recorded_at', 'Not available')}"
-                        )
-                    prediction_context = "Recent educational prediction history: " + " | ".join(prediction_lines)
-                else:
-                    prediction_context = "No saved model predictions are available."
-
-                language_instruction = {
-                    "Match my message": "Reply in the same language and style as the user's latest message.",
-                    "English": "Reply in simple English.",
-                    "Hindi": "Reply in simple Hindi using Devanagari script.",
-                    "Hinglish": "Reply in simple conversational Hinglish using Latin script."
-                }[response_language]
-
-                system_prompt = f"""
-You are an educational AI Health Assistant in a college academic prototype.
-{language_instruction}
-
-For each health-related question, use these headings when relevant:
-1. **Understanding your concern** - briefly restate the question or symptoms without adding symptoms.
-2. **General information** - explain possible general meanings; do not identify a definite disease.
-3. **General self-care** - give low-risk, non-medicine guidance only when appropriate. Do not recommend prescription or OTC medicines, dosages, or treatment plans.
-4. **When to seek medical help** - explain when the user should contact a qualified healthcare professional.
-5. **Urgent warning** - if the user describes chest pain, severe breathing difficulty, fainting/unconsciousness, stroke signs, severe allergic reaction, heavy bleeding, or another immediate danger, tell them to seek local emergency medical help now. Do not delay urgent care for further chat.
-
-Safety rules:
-- Never diagnose, prescribe, recommend medicine dosages, or claim certainty.
-- Do not treat the project's machine-learning output as a diagnosis or medical evidence.
-- Dashboard readings are manually entered and may be inaccurate; do not infer a diagnosis from them.
-- Explain that a single reading cannot establish a medical condition.
-- Do not falsely reassure or say a person is safe based only on this limited context.
-- Do not request personally identifying information.
-- Keep the response clear, concise and practical. If the question is not medical, answer normally and briefly.
-- This is an academic prototype, not a medical device.
-"""
-
-                context_message = (
-                    "Limited context from the patient's local dashboard. Do not repeat "
-                    "identifying details; none are supplied. "
-                    + health_context + " " + prediction_context
-                )
-
-                try:
-                    client = OpenAI(
-                        api_key=os.environ["OPENROUTER_API_KEY"],
-                        base_url="https://openrouter.ai/api/v1"
-                    )
-                    response = client.chat.completions.create(
-                        model="openrouter/free",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "system", "content": context_message},
-                            *[
-                                {"role": item["role"], "content": item["content"]}
-                                for item in st.session_state.health_assistant_messages[-10:]
-                            ]
-                        ],
-                        temperature=0.3
-                    )
-                    assistant_reply = (
-                        response.choices[0].message.content
-                        or "I could not generate a response. Please try again."
-                    )
-                    with st.chat_message("assistant"):
-                        st.markdown(assistant_reply)
-
-                except Exception as exc:
-                    assistant_reply = (
-                        "The AI service could not respond right now. Please try again "
-                        "later. Technical detail: " + str(exc)
-                    )
-                    with st.chat_message("assistant"):
-                        st.error(assistant_reply)
-
-            st.session_state.health_assistant_messages.append(
-                {"role": "assistant", "content": assistant_reply}
-            )
-
-        clear_col, info_col = st.columns([1, 3])
-        with clear_col:
-            if st.button("Clear AI chat", key="clear_health_assistant"):
-                st.session_state.health_assistant_messages = []
-                st.rerun()
-        with info_col:
-            st.caption(
-                "Avoid sharing identifiable or sensitive medical information. "
-                "For emergencies, contact local emergency services immediately."
-            )
-
-    # ---------------- PREDICTION HISTORY ----------------
-
-    with history_tab:
-
-        st.subheader("Your Previous Predictions")
-
-        history = database.get_prediction_history(
-            patient["patient_id"]
-        )
-
-        if history:
-
-            history_df = pd.DataFrame(history)
-
-            history_df = history_df.rename(columns={
-                "predicted_class": "Predicted Result",
-                "symptoms": "Symptoms",
-                "recorded_at": "Date and Time"
-            })
-
-            st.dataframe(
-                history_df[
-                    ["Date and Time", "Symptoms", "Predicted Result"]
-                ],
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.info(
-                "No prediction history yet. Your previous predictions "
-                "will appear here."
-            )
+    if st.session_state.patient is None:
+        if st.button("🔐 Login / Register", use_container_width=True):
+            st.session_state.active_view = "Login / Register"
+            st.rerun()
+    else:
+        patient = st.session_state.patient
+        st.success(f"👤 **{patient['full_name']}**")
+        st.caption(f"ID: {patient['patient_id']}")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.patient = None
+            st.session_state.active_view = "AI Health Assistant"
+            st.rerun()
 
 
+# ---------------- MAIN ROUTING ----------------
 
-    # ---------------- PDF HEALTH REPORT ----------------
-    with report_tab:
-        st.subheader("Downloadable Patient Health Report")
-        st.caption(
-            "Create a PDF summary of your profile, manually entered health "
-            "readings and saved educational model predictions."
-        )
-        report_health = database.get_health_history(patient["patient_id"])
-        report_predictions = database.get_prediction_history(patient["patient_id"])
+render_top_navbar()
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Saved health readings", len(report_health))
-        col2.metric("Saved predictions", len(report_predictions))
-        col3.metric("Readings included", min(len(report_health), 30))
+current_view = st.session_state.active_view
 
-        st.info(
-            "The report includes up to the latest 30 health readings and 20 "
-            "prediction records. It contains sensitive personal information; "
-            "download and share it only with the patient's permission."
-        )
-
-        if st.button("Generate PDF Health Report", type="primary"):
-            try:
-                pdf_bytes = build_patient_health_pdf(
-                    patient,
-                    report_health,
-                    report_predictions
-                )
-                st.session_state["patient_health_pdf"] = pdf_bytes
-                st.success("Your PDF report is ready.")
-            except Exception as exc:
-                st.error(f"Could not generate the PDF report: {exc}")
-
-        if st.session_state.get("patient_health_pdf"):
-            patient_code = re.sub(
-                r"[^A-Za-z0-9_-]",
-                "_",
-                str(patient.get("patient_id", "patient"))
-            )
-            st.download_button(
-                label="Download Patient Health Report (PDF)",
-                data=st.session_state["patient_health_pdf"],
-                file_name=f"health_report_{patient_code}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-# ---------------- APPLICATION ENTRY ----------------
-
-if st.session_state.patient is None:
-    authentication_page()
-else:
-    patient_dashboard()
-
-st.divider()
-
-st.caption(
-    "Major Project | AI-Based Smart Patient Health Monitoring "
-    "and Early Disease Prediction System"
-)
+if current_view == "AI Health Assistant":
+    render_ai_assistant()
+elif current_view == "Disease Prediction":
+    render_disease_prediction()
+elif current_view == "Health Monitoring":
+    render_health_monitoring()
+elif current_view == "Records & PDF Report":
+    render_history_and_report()
+elif current_view == "ML Benchmarking":
+    render_ml_benchmark()
+elif current_view == "Login / Register":
+    render_authentication_view()
